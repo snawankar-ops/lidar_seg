@@ -1,0 +1,10 @@
+description
+
+- Use vehicle.yaml geometry: per-sensor mounts, base_link ROI, footprint body cut-out,
+  sensor_height from mount
+- Box long clusters (walls) in 4 m pieces instead of dropping them (max_box unused)
+- Velocity tracker with lead-time compensation from current-frame compute time
+- Markers: stable ids, explicit DELETE, stamp 0 to avoid RViz TF drops
+- Faster pre-processing (range gate first, float32), numpy cloud publisher,
+  non-numba ground-filter fallback
+- Log per-stage ms, cluster count, longest cluster

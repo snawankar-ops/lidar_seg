@@ -21,14 +21,55 @@ from scipy.sparse.csgraph import connected_components
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs_py import point_cloud2
+from sensor_msgs.msg import PointCloud2, PointField
 from visualization_msgs.msg import Marker, MarkerArray
 
 try:
     from numba import njit
 except ImportError:
     njit = None
+
+# ======================================================================
+# VEHICLE GEOMETRY (from vehicle.yaml - built-in copy; pass -p vehicle_yaml:=/path/vehicle.yaml to override)
+# ======================================================================
+VEHICLE = dict(
+    base_link_height=0.23,                       # base_link (rear-axle centre) above the ground
+    footprint=[[-0.83, -0.72], [2.80, -0.72], [2.80, 0.72], [-0.83, 0.72]],   # in base_link, x fwd, y left
+    ouster_lidar_z=0.038195,                     # os_*_sensor -> os_*_lidar (cloud frame is the lidar frame)
+    sensors={                                    # base_link -> os_*_sensor: x, y, z, yaw
+        "os_top": (1.94, 0.0, 1.617, 0.0),
+        "os_front": (2.716, 0.655, 0.327, 0.785398),
+        "os_back": (-0.75, -0.57, 0.282, -2.356194),
+    },
+)
+
+
+def load_vehicle(path):
+    """Read the same fields from vehicle.yaml (needs PyYAML, which ROS 2 installs)."""
+    import yaml
+    with open(path) as f:
+        y = yaml.safe_load(f)
+    return dict(
+        base_link_height=float(y["geometry"]["base_link_height"]),
+        footprint=[list(map(float, p)) for p in y["footprint"]],
+        ouster_lidar_z=float(y["ouster_lidar_z"]),
+        sensors={k: (*map(float, v["xyz"]), float(v["yaw"]))
+                 for k, v in y["sensors"].items() if k.startswith("os_")})
+
+
+def sensor_mount(veh, name):
+    """-> (tx, ty, tz, yaw): cloud (os_*_lidar) frame in base_link, plus its height above the ground."""
+    x, y, z, yaw = veh["sensors"][name]
+    tz = z + veh["ouster_lidar_z"]
+    return dict(tx=x, ty=y, tz=tz, yaw=yaw, height=tz + veh["base_link_height"])
+
+
+def to_base(xyz, m):
+    """Cloud-frame points -> base_link frame (yaw + translation; mounts are assumed level)."""
+    c, s = np.cos(m["yaw"]), np.sin(m["yaw"])
+    return np.stack([m["tx"] + xyz[:, 0] * c - xyz[:, 1] * s,
+                     m["ty"] + xyz[:, 0] * s + xyz[:, 1] * c,
+                     m["tz"] + xyz[:, 2]], axis=1)
 
 # ======================================================================
 # RAY GROUND FILTER
@@ -124,17 +165,29 @@ def ray_ground_mask(xyz, sensor_height=None, radial_div_deg=1.0,
             float(np.tan(np.radians(local_max_slope_deg))),
             float(np.tan(np.radians(initial_max_slope_deg))),
             float(min_height), float(reclass_dist))
-    if njit is not None:
-        out = np.zeros(n, np.bool_)
-        _kernel(rs, zs, rays, *args, out)
-    else:                                     # lists index faster than numpy scalars
-        out = [False] * n
-        _kernel(rs.tolist(), zs.tolist(), rays.tolist(), *args, out)
-        out = np.asarray(out, bool)
+    if njit is None:
+        # No numba: the python loop is ~100x slower and is the #1 cause of lag.
+        return _ground_mask_vectorized(xyz, r, z_ref, args[1], min_height)
+    out = np.zeros(n, np.bool_)
+    _kernel(rs, zs, rays, *args, out)
 
     mask = np.zeros(n, bool)
     mask[order] = out
     return mask
+
+
+def _ground_mask_vectorized(xyz, r, z_ref, tan_g, min_h, cell=0.5):
+    """Fast numpy-only fallback: ground = close to the lowest point of its 0.5 m cell AND inside the
+    global cone around the known ground level. Less precise than the ray filter on slopes."""
+    z = xyz[:, 2]
+    k = np.floor(xyz[:, :2] / cell).astype(np.int64)
+    k -= k.min(axis=0)
+    flat = k[:, 0] * (k[:, 1].max() + 1) + k[:, 1]
+    _, inv = np.unique(flat, return_inverse=True)
+    zmin = np.full(inv.max() + 1, np.inf)
+    np.minimum.at(zmin, inv, z)
+    thr = np.maximum(tan_g * r, min_h)
+    return ((z - zmin[inv]) <= min_h) & (np.abs(z - z_ref) <= thr)
 
 # ======================================================================
 # EUCLIDEAN CLUSTERING (KD-TREE)
@@ -266,21 +319,52 @@ def voxel_downsample(xyz, v):
 
 def in_roi(xyz, a):
     """Region of interest: radial range AND an x/y/z box in the sensor frame (x fwd, y left, z up)."""
-    r = np.hypot(xyz[:, 0], xyz[:, 1])
-    return ((r > a.min_range) & (r < a.max_range) &
-            (xyz[:, 0] >= a.roi_x[0]) & (xyz[:, 0] <= a.roi_x[1]) &
-            (xyz[:, 1] >= a.roi_y[0]) & (xyz[:, 1] <= a.roi_y[1]) &
-            (xyz[:, 2] >= a.roi_z[0]) & (xyz[:, 2] <= a.roi_z[1]))
+    r = np.hypot(xyz[:, 0], xyz[:, 1])        # range limits are from the sensor
+    m = getattr(a, "mount", None)
+    b = to_base(xyz, m) if m else xyz         # ROI box is in base_link (vehicle) frame when a mount is known
+    ok = ((r > a.min_range) & (r < a.max_range) &
+          (b[:, 0] >= a.roi_x[0]) & (b[:, 0] <= a.roi_x[1]) &
+          (b[:, 1] >= a.roi_y[0]) & (b[:, 1] <= a.roi_y[1]) &
+          (b[:, 2] >= a.roi_z[0]) & (b[:, 2] <= a.roi_z[1]))
+    ego = getattr(a, "ego_box", None)
+    if m and ego is not None:                 # cut out the vehicle's own body (footprint + margin)
+        body = ((b[:, 0] >= ego[0]) & (b[:, 0] <= ego[1]) &
+                (b[:, 1] >= ego[2]) & (b[:, 1] <= ego[3]) &
+                (b[:, 2] >= a.ego_z[0]) & (b[:, 2] <= a.ego_z[1]))
+        ok &= ~body
+    return ok
+
+
+def _fast_clusters(pts, eps, min_size, cv):
+    """Clustering on a coarser grid (cell cv): query_pairs cost grows with neighbours^2, so linking one
+    representative per cv-cell and mapping labels back is several times cheaper at the same eps."""
+    if cv <= 0 or len(pts) == 0:
+        return euclidean_clustering(pts, eps, min_size)
+    k = np.floor(pts / cv).astype(np.int64)
+    k -= k.min(axis=0)
+    dims = k.max(axis=0) + 1
+    flat = (k[:, 0] * dims[1] + k[:, 1]) * dims[2] + k[:, 2]
+    _, first, inv = np.unique(flat, return_index=True, return_inverse=True)
+    lab_rep = _labels_fast(pts[first], eps)
+    lab = lab_rep[inv]
+    counts = np.bincount(lab)
+    order = np.argsort(lab, kind="stable")
+    groups = np.split(order, np.cumsum(counts)[:-1])
+    return [g for g, c in zip(groups, counts) if c >= min_size]
 
 
 def segment(pts, a):
     """pts: (N,3+) lidar cloud (only x,y,z used) -> dict with filtered xyz, ground mask, cluster labels, boxes.
     Order (cheapest first): ROI crop -> voxel downsample -> ground filter -> clustering -> boxes."""
     tp0 = time.perf_counter()
-    xyz = pts[:, :3].astype(np.float64)
-    valid = np.isfinite(xyz).all(axis=1) & (np.abs(xyz).sum(axis=1) > 1e-6)   # drop (0,0,0) no-returns
-    valid &= in_roi(xyz, a)
-    idx = np.where(valid)[0]
+    p3 = pts[:, :3]                                        # stay float32 until the ROI has thinned the cloud
+    r2 = p3[:, 0] * p3[:, 0] + p3[:, 1] * p3[:, 1]
+    cand = np.flatnonzero((r2 > a.min_range ** 2) & (r2 < a.max_range ** 2) &   # cheap range gate first
+                          np.isfinite(p3[:, 2]) & ((r2 + p3[:, 2] * p3[:, 2]) > 1e-9))   # drops NaN and (0,0,0)
+    cand = cand[in_roi(p3[cand], a)]                       # base-frame ROI + body cut-out on the survivors only
+    xyz = np.zeros((len(pts), 3))                          # float64 only for what is left
+    idx = cand
+    xyz[idx] = p3[idx]
     n_roi = len(idx)
     keep = idx[voxel_downsample(xyz[idx], a.voxel)]       # raw indices of the points we keep
     xyz = xyz[keep]
@@ -303,12 +387,32 @@ def segment(pts, a):
         z_ground = 0.0
     obs = np.where((~ground) & (xyz[:, 2] - z_ground < a.max_height))[0]
 
-    clusters = euclidean_clustering(xyz[obs], a.eps, a.min_size)
+    clusters = _fast_clusters(xyz[obs], a.eps, a.min_size, getattr(a, "cluster_voxel", 0.0))
     boxes = []
     obs_label = np.full(len(obs), -1, np.int64)
+    split_len = float(getattr(a, "split_len", 0.0))
+    max_len = 0.0
     for c in clusters:
-        b = fit_box_3d(xyz[obs[c]])
-        if max(b["l"], b["w"]) > a.max_box:
+        pc = xyz[obs[c]]
+        b = fit_box_3d(pc)
+        length = max(b["l"], b["w"])
+        max_len = max(max_len, length)
+        if split_len > 0 and length > split_len:
+            # Long thing (wall, fence, hedge, or a wall merged with a bit of leaked floor): box it in
+            # equal pieces along its long axis. Never dropped, however long (max_box is no longer used).
+            yaw = b["yaw"] if b["l"] >= b["w"] else b["yaw"] + np.pi / 2
+            proj = (pc[:, 0] - b["cx"]) * np.cos(yaw) + (pc[:, 1] - b["cy"]) * np.sin(yaw)
+            n_seg = min(int(np.ceil(length / split_len)), 16)     # cap the marker count
+            piece = np.minimum(((proj - proj.min()) / (length / n_seg + 1e-9)).astype(int), n_seg - 1)
+            for k in range(n_seg):
+                sel = np.where(piece == k)[0]
+                if len(sel) < a.min_size:
+                    continue
+                bk = fit_box_3d(pc[sel])
+                bk["id"] = len(boxes)
+                bk["n"] = int(len(sel))
+                obs_label[c[sel]] = bk["id"]
+                boxes.append(bk)
             continue
         b["id"] = len(boxes)
         b["n"] = int(len(c))
@@ -321,7 +425,8 @@ def segment(pts, a):
 
     return dict(keep=keep, xyz=xyz, ground=ground, point_label=point_label, boxes=boxes,
                 ms_pre=(t0 - tp0) * 1000, ms_ground=(t1 - t0) * 1000, ms_cluster=(t2 - t1) * 1000,
-                z_ground=z_ground, n_raw=len(pts), n_roi=n_roi, n_vox=len(xyz))
+                z_ground=z_ground, n_raw=len(pts), n_roi=n_roi, n_vox=len(xyz),
+                n_clusters=len(clusters), max_len=max_len)
 
 # ======================================================================
 # ROS 2 LIVE NODE
@@ -352,6 +457,89 @@ def yaw_to_quat(yaw):
     return 0.0, 0.0, float(np.sin(yaw / 2)), float(np.cos(yaw / 2))
 
 
+def xyz_to_cloud(header, xyz):
+    """(N,3) -> PointCloud2 with plain numpy (much faster than point_cloud2.create_cloud_xyz32)."""
+    xyz = np.ascontiguousarray(xyz, dtype=np.float32)
+    m = PointCloud2()
+    m.header = header
+    m.height, m.width = 1, len(xyz)
+    m.fields = [PointField(name=n, offset=4 * i, datatype=PointField.FLOAT32, count=1)
+                for i, n in enumerate("xyz")]
+    m.is_bigendian = False
+    m.point_step = 12
+    m.row_step = 12 * len(xyz)
+    m.is_dense = True
+    m.data = xyz.tobytes()
+    return m
+
+
+class BoxTracker:
+    """Constant-velocity tracker. Predicts where each box should be this frame, matches detections to
+    the prediction (so fast movers - bikes - are not lost), keeps stable ids, coasts through missed
+    frames, and can push the output forward in time to hide the processing delay."""
+
+    def __init__(self, gate=2.5, min_hits=1, max_miss=4, alpha=0.8, max_speed=15.0):
+        self.gate, self.min_hits, self.max_miss, self.alpha = gate, min_hits, max_miss, alpha
+        self.max_speed = max_speed
+        self.tracks = []
+        self.next_id = 0
+        self.t = None
+
+    def update(self, boxes, t, lead=0.0):
+        dt = 0.1 if self.t is None else float(np.clip(t - self.t, 0.02, 0.5))
+        self.t = t
+        T, D = self.tracks, boxes
+        for tr in T:                                  # predict
+            tr["px"] = tr["cx"] + tr["vx"] * dt
+            tr["py"] = tr["cy"] + tr["vy"] * dt
+        pairs = sorted(((np.hypot(tr["px"] - d["cx"], tr["py"] - d["cy"]), i, j)
+                        for i, tr in enumerate(T) for j, d in enumerate(D)), key=lambda p: p[0])
+        used_t, used_d = set(), set()
+        for dist, i, j in pairs:
+            if dist > self.gate:
+                break
+            if i in used_t or j in used_d:
+                continue
+            used_t.add(i)
+            used_d.add(j)
+            tr, d, al = T[i], D[j], self.alpha
+            ox, oy = tr["cx"], tr["cy"]
+            tr["cx"] = tr["px"] + al * (d["cx"] - tr["px"])      # high alpha = little lag
+            tr["cy"] = tr["py"] + al * (d["cy"] - tr["py"])
+            vx, vy = (tr["cx"] - ox) / dt, (tr["cy"] - oy) / dt
+            sp = np.hypot(vx, vy)
+            if sp > self.max_speed:
+                vx, vy = vx * self.max_speed / sp, vy * self.max_speed / sp
+            tr["vx"] = 0.5 * tr["vx"] + 0.5 * vx
+            tr["vy"] = 0.5 * tr["vy"] + 0.5 * vy
+            for k in ("cz", "l", "w", "h"):
+                tr[k] = 0.5 * d[k] + 0.5 * tr[k]
+            # yaw has period pi -> blend on the doubled angle
+            s = 0.5 * np.sin(2 * d["yaw"]) + 0.5 * np.sin(2 * tr["yaw"])
+            c = 0.5 * np.cos(2 * d["yaw"]) + 0.5 * np.cos(2 * tr["yaw"])
+            tr["yaw"] = float(0.5 * np.arctan2(s, c))
+            tr["hits"] += 1
+            tr["miss"] = 0
+            tr["n"] = d["n"]
+        for i, tr in enumerate(T):
+            if i not in used_t:                       # coast on the prediction
+                tr["cx"], tr["cy"] = tr["px"], tr["py"]
+                tr["miss"] += 1
+        for j, d in enumerate(D):
+            if j not in used_d:
+                T.append(dict(d, id=self.next_id, hits=1, miss=0, vx=0.0, vy=0.0, px=d["cx"], py=d["cy"]))
+                self.next_id += 1
+        self.tracks = [tr for tr in T if tr["miss"] <= self.max_miss]
+        out = []
+        for tr in self.tracks:
+            if tr["hits"] >= self.min_hits:
+                o = dict(tr)
+                o["cx"] += tr["vx"] * lead            # show where it is NOW, not where it was at scan time
+                o["cy"] += tr["vy"] * lead
+                out.append(o)
+        return out
+
+
 class LiveNode(Node):
     def __init__(self):
         super().__init__("lidar_pipeline_live")
@@ -359,20 +547,61 @@ class LiveNode(Node):
         # every knob from the old argparse section becomes a ROS parameter
         defaults = dict(
             topic="/os_front/points",
-            min_range=0.8, max_range=30.0,
-            roi_x=[-10.0, 30.0], roi_y=[-15.0, 15.0], roi_z=[-3.0, 3.0],
-            max_height=2.5,
-            sensor_height=0.0,           # metres above ground; 0.0 = estimate from the cloud
+            sensor="auto",              # os_top | os_front | os_back; auto = guessed from the topic name
+            vehicle_yaml="",            # optional path to vehicle.yaml; empty = built-in copy
+            min_range=0.8, max_range=25.0,
+            # ROI is in base_link (rear-axle centre, x fwd, y left, z up; ground is at z = -0.23)
+            roi_x=[-6.0, 25.0], roi_y=[-12.0, 12.0], roi_z=[-0.8, 2.6],
+            # vehicle body cut-out: footprint + margin, between these base_link heights
+            ego_margin=0.15, ego_z=[-0.55, 1.95],
+            max_height=2.2,              # vehicle is ~1.8-1.9 m tall: anything higher can be driven under
+            sensor_height=0.0,           # 0.0 = taken from vehicle.yaml mount (axle height + z + lidar z)
             ray_div=1.0, slope_deg=10.0, init_slope_deg=3.0, min_h=0.15,
-            voxel=0.1, eps=0.5, min_size=8, max_box=12.0,
+            # eps 0.8: sparse far rings on a wall are >0.6 m apart and would not link into one cluster
+            voxel=0.15, eps=0.8, min_size=6,
+            cluster_voxel=0.3,           # clustering grid (faster); 0 = cluster every voxel point
+            split_len=4.0,              # clusters longer than this (walls) are boxed in pieces; 0 = off
+            max_box=0.0,                 # unused now: long clusters are split, never dropped
+            # temporal smoothing of boxes (stops flicker)
+            track_gate=2.5, track_min_hits=1, track_max_miss=4, track_alpha=0.8,
+            lead_extra=0.03,             # s added to the measured compute time when pushing boxes forward
+            box_lifetime=1.0,            # long on purpose: removed boxes are DELETEd explicitly, so a short
+                                         # lifetime only causes blinking if stamps lag RViz's clock
         )
         for k, v in defaults.items():
             self.declare_parameter(k, v)
         p = lambda k: self.get_parameter(k).value
         self.a = SimpleNamespace(**{k: p(k) for k in defaults if k != "topic"})
-        if self.a.sensor_height <= 0:
-            self.a.sensor_height = None  # segment() treats None as "estimate"
+        veh = load_vehicle(p("vehicle_yaml")) if p("vehicle_yaml") else VEHICLE
+        name = p("sensor")
+        if name == "auto":
+            name = next((k for k in veh["sensors"] if k in p("topic")), None)
+        if name in veh["sensors"]:
+            m = sensor_mount(veh, name)
+            self.a.mount = m
+            fp = np.asarray(veh["footprint"], float)
+            mg = self.a.ego_margin
+            self.a.ego_box = (fp[:, 0].min() - mg, fp[:, 0].max() + mg,
+                              fp[:, 1].min() - mg, fp[:, 1].max() + mg)
+            if self.a.sensor_height <= 0:
+                self.a.sensor_height = m["height"]
+            self.get_logger().info(f"{name}: {m['height']:.3f} m above ground, yaw {m['yaw']:.3f} rad, "
+                                   f"body cut-out x[{self.a.ego_box[0]:.2f},{self.a.ego_box[1]:.2f}] "
+                                   f"y[{self.a.ego_box[2]:.2f},{self.a.ego_box[3]:.2f}]")
+        else:
+            self.a.mount = None
+            self.get_logger().warn(f"unknown sensor for topic '{p('topic')}': set -p sensor:=os_front|os_top|"
+                                   "os_back. ROI/body cut-out fall back to the raw sensor frame!")
+            if self.a.sensor_height <= 0:
+                self.a.sensor_height = None  # segment() treats None as "estimate"
+        self.tracker = BoxTracker(self.a.track_gate, self.a.track_min_hits,
+                                  self.a.track_max_miss, self.a.track_alpha)
+        self.prev_ids = set()
+        self.lead = 0.1
 
+        if njit is None:
+            self.get_logger().warn("numba NOT installed -> slow fallback ground filter. "
+                                   "Run: pip install numba  (biggest single fix for lag)")
         # Warm up numba now so the first real frame isn't a 5-second compile stall.
         ray_ground_mask(np.random.rand(500, 3) * [20, 20, 0.1] - [10, 10, 1.8])
 
@@ -390,21 +619,40 @@ class LiveNode(Node):
         pts = cloud_to_xyz(msg)
         seg = segment(pts, self.a)
 
-        self.publish_boxes(msg.header, seg["boxes"])
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # How stale will these boxes be when they appear? = time spent on THIS frame so far (+ a bit for
+        # publishing). Push each box forward along its velocity by that much so a fast bike's box sits on it.
+        lead = (time.perf_counter() - t0) + self.a.lead_extra
+        tracks = self.tracker.update(seg["boxes"], stamp, lead)
         obs = seg["point_label"] >= 0
-        self.pub_obs.publish(point_cloud2.create_cloud_xyz32(
-            msg.header, seg["xyz"][obs].astype(np.float32)))
+        self.pub_obs.publish(xyz_to_cloud(msg.header, seg["xyz"][obs]))
+        self.publish_boxes(msg.header, tracks)
 
         ms = (time.perf_counter() - t0) * 1000
-        self.get_logger().info(f"{len(pts)} pts -> {len(seg['boxes'])} boxes in {ms:.0f} ms",
-                               throttle_duration_sec=2.0)
+        if ms > 200:                      # vehicle.yaml command_timeout is 0.4 s: keep perception well inside it
+            self.get_logger().warn(f"frame took {ms:.0f} ms - too slow for the 0.4 s command_timeout budget",
+                                   throttle_duration_sec=2.0)
+        self.get_logger().info(
+            f"{len(pts)} pts -> roi {seg['n_roi']} -> vox {seg['n_vox']} | {len(tracks)} boxes | "
+            f"{ms:.0f} ms (pre {seg['ms_pre']:.0f}, ground {seg['ms_ground']:.0f}, "
+            f"cluster {seg['ms_cluster']:.0f}) | {seg['n_clusters']} clusters, longest {seg['max_len']:.1f} m",
+            throttle_duration_sec=2.0)
 
     def publish_boxes(self, header, boxes):
         arr = MarkerArray()
-        clear = Marker()
-        clear.header = header
-        clear.action = Marker.DELETEALL          # wipe last frame's boxes
-        arr.markers.append(clear)
+        # No DELETEALL: wiping + re-adding every frame is what makes RViz boxes blink.
+        # Each box keeps its tracker id, and only ids that disappeared get an explicit DELETE.
+        # Stamp 0 = "use the newest TF". The boxes are already pushed forward to 'now', and a scan-time
+        # stamp makes RViz silently drop a marker whenever TF for that exact time isn't there yet (blinking).
+        header = type(header)(frame_id=header.frame_id)
+        ids = {int(b["id"]) for b in boxes}
+        for old in self.prev_ids - ids:
+            d = Marker()
+            d.header = header
+            d.ns, d.id, d.action = "boxes", old, Marker.DELETE
+            arr.markers.append(d)
+        self.prev_ids = ids
+        life = float(self.a.box_lifetime)
         for b in boxes:
             m = Marker()
             m.header = header
@@ -415,7 +663,8 @@ class LiveNode(Node):
              m.pose.orientation.z, m.pose.orientation.w) = yaw_to_quat(b["yaw"])
             m.scale.x, m.scale.y, m.scale.z = b["l"], b["w"], b["h"]
             m.color.g, m.color.a = 1.0, 0.4
-            m.lifetime.nanosec = 200_000_000     # auto-expire if the node stalls
+            m.lifetime.sec = int(life)           # auto-expire if the node stalls (must exceed frame time)
+            m.lifetime.nanosec = int((life % 1) * 1e9)
             arr.markers.append(m)
         self.pub_boxes.publish(arr)
 
