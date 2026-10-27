@@ -299,4 +299,4 @@ If both are about 10 Hz, the node is keeping up.
 |---|---|
 | `live_pipeline.py` | The node (everything in one file) |
 | `README.md` | This file |
-| `live_pipeline_report.tex` / `.pdf` | Detailed description of the code and its analysis |
+| `pipeline_report.pdf` | Detailed description of the code and its analysis |
